@@ -2832,11 +2832,15 @@ class BasePlatformAdapter(ABC):
 
         coerce_plaintext_gateway_command(event)
         
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        adapter_key_fn = getattr(self, "build_session_key", None)
+        if callable(adapter_key_fn):
+            session_key = adapter_key_fn(event.source)
+        else:
+            session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            )
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or

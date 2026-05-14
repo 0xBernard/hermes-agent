@@ -739,6 +739,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
                     return
 
+                if isinstance(message.channel, discord.DMChannel):
+                    dm_policy = str(self.config.extra.get("dm_policy", "allow")).strip().lower()
+                    if dm_policy in {"ignore", "off", "disabled", "deny"}:
+                        return
+
                 # Bot message filtering (DISCORD_ALLOW_BOTS):
                 #   "none"     — ignore all other bots (default)
                 #   "mentions" — accept bot messages only when they @mention us
@@ -3555,13 +3560,58 @@ class DiscordAdapter(BasePlatformAdapter):
         from gateway.platforms.base import resolve_channel_prompt
         return resolve_channel_prompt(self.config.extra, channel_id, parent_id)
 
-    def _discord_require_mention(self) -> bool:
+    @staticmethod
+    def _discord_bool(value: Any, default: bool) -> bool:
+        """Coerce a Discord config value to bool."""
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.lower() not in {"false", "0", "no", "off"}
+        return bool(value)
+
+    def _discord_guild_override(self, guild: Any, key: str) -> Any:
+        """Return a per-guild Discord override value, if configured."""
+        if isinstance(guild, str):
+            guild_id = guild
+            guild_name = ""
+        else:
+            guild_id = str(getattr(guild, "id", "") or "")
+            guild_name = str(getattr(guild, "name", "") or "")
+        if not guild_id and not guild_name:
+            return None
+
+        raw = (
+            self.config.extra.get("guild_overrides")
+            or self.config.extra.get("server_overrides")
+            or {}
+        )
+        candidates = []
+        if isinstance(raw, dict):
+            for lookup in (guild_id, guild_name):
+                if lookup and isinstance(raw.get(lookup), dict):
+                    candidates.append(raw[lookup])
+        elif isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get("id") or item.get("guild_id") or item.get("server_id") or "")
+                item_name = str(item.get("name") or item.get("guild") or item.get("server") or "")
+                if (guild_id and item_id == guild_id) or (guild_name and item_name == guild_name):
+                    candidates.append(item)
+
+        for cfg in candidates:
+            if key in cfg:
+                return cfg[key]
+        return None
+
+    def _discord_require_mention(self, guild: Any = None) -> bool:
         """Return whether Discord channel messages require a bot mention."""
+        override = self._discord_guild_override(guild, "require_mention")
+        if override is not None:
+            return self._discord_bool(override, True)
         configured = self.config.extra.get("require_mention")
         if configured is not None:
-            if isinstance(configured, str):
-                return configured.lower() not in {"false", "0", "no", "off"}
-            return bool(configured)
+            return self._discord_bool(configured, True)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
     def _discord_allow_any_attachment(self) -> bool:
@@ -3600,6 +3650,26 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return 32 * 1024 * 1024
         return max(0, value)
+
+    def _discord_auto_thread(self, guild: Any = None) -> bool:
+        """Return whether Discord should auto-create threads for mentions."""
+        override = self._discord_guild_override(guild, "auto_thread")
+        if override is not None:
+            return self._discord_bool(override, True)
+        configured = self.config.extra.get("auto_thread")
+        if configured is not None:
+            return self._discord_bool(configured, True)
+        return os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes", "on"}
+
+    def _discord_group_sessions_per_user(self, guild: Any = None) -> bool:
+        """Return whether group/channel sessions should be isolated per user."""
+        override = self._discord_guild_override(guild, "group_sessions_per_user")
+        if override is not None:
+            return self._discord_bool(override, True)
+        configured = self.config.extra.get("group_sessions_per_user")
+        if configured is not None:
+            return self._discord_bool(configured, True)
+        return True
 
     def _discord_free_response_channels(self) -> set:
         """Return Discord channel IDs where no bot mention is required.
@@ -4479,7 +4549,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if parent_channel_id:
                 channel_ids.add(parent_channel_id)
 
-            require_mention = self._discord_require_mention()
+            require_mention = self._discord_require_mention(getattr(message, "guild", None))
             # Voice-linked text channels act as free-response while voice is active.
             # Only the exact bound channel gets the exemption, not sibling threads.
             voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
@@ -4514,7 +4584,7 @@ class DiscordAdapter(BasePlatformAdapter):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
             skip_thread = bool(channel_ids & no_thread_channels) or is_free_channel
-            auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
+            auto_thread = self._discord_auto_thread(getattr(message, "guild", None))
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
                 thread = await self._auto_create_thread(message)
@@ -4806,7 +4876,7 @@ class DiscordAdapter(BasePlatformAdapter):
         from gateway.session import build_session_key
         return build_session_key(
             event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            group_sessions_per_user=self._discord_group_sessions_per_user(event.source.guild_id),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
 

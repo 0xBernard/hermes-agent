@@ -1687,6 +1687,15 @@ class GatewayRunner:
 
     def _session_key_for_source(self, source: SessionSource) -> str:
         """Resolve the current session key for a source, honoring gateway config when available."""
+        adapter = getattr(self, "adapters", {}).get(source.platform) if source else None
+        adapter_key_fn = getattr(adapter, "build_session_key", None)
+        if callable(adapter_key_fn):
+            try:
+                session_key = adapter_key_fn(source)
+                if isinstance(session_key, str) and session_key:
+                    return session_key
+            except Exception:
+                pass
         if hasattr(self, "session_store") and self.session_store is not None:
             try:
                 session_key = self.session_store._generate_session_key(source)
